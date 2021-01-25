@@ -1,11 +1,24 @@
 const Alexa = require('ask-sdk-core');
 const axios = require('axios');
 const moment = require("moment");
-const persistenceAdapter = require('ask-sdk-s3-persistence-adapter');
+const Util = require('./util');
+
+const serviceAccount = require("firebase.json");
+const admin = require('firebase-admin');
+
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "https://ada-engage.firebaseio.com"
+})
+const DB = admin.firestore();
+
+const LECTURE = "lecture";
+const STUDY = "study";
+const BREAK = "break";
 
 const timerItem = {
-    "duration": "PT15S",
-    "timerLabel": "demo",
+    "duration": "",
+    "timerLabel": "",
     "creationBehavior": {
         "displayExperience": {
             "visibility": "VISIBLE"
@@ -17,12 +30,12 @@ const timerItem = {
             "textToAnnounce": [
                 {
                     "locale": "en-US",
-                    "text": "This ends your timer."
+                    "text": ""
                 }
             ]
         },
         "notificationConfig": {
-            "playAudible": true
+            "playAudible": false
         }
     }
 };
@@ -30,10 +43,10 @@ const timerItem = {
 const STREAMS = [
     {
         token: '1',
-        url: 'https://streaming.radionomy.com/-ibizaglobalradio-?lang=en-US&appName=iTunes.m3u',
+        url: 'https://streamingv2.shoutcast.com/100-CHILL?lang=en-US%2cen%3bq%3d0.9',
         metadata: {
-            title: 'Stream One',
-            subtitle: 'A subtitle for stream one',
+            title: 'Music',
+            subtitle: 'Chill music to study to',
             art: {
                 sources: [
                     {
@@ -60,9 +73,7 @@ const STREAMS = [
 
 const LaunchRequestHandler = {
     canHandle(handlerInput) {
-        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'LaunchRequest'
-            || (Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
-                && (Alexa.getIntentName(handlerInput.requestEnvelope) === 'TimerStartIntent'));
+        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'LaunchRequest';
     },
     handle(handlerInput) {
 
@@ -84,9 +95,10 @@ const LaunchRequestHandler = {
                 });
 
         } else {
+            let speakerOutput = "Welcome to Ada! Would you like to start a lecture, study session, or discussion?";
             handlerInput.responseBuilder
-                .speak("Welcome to Ada! Would you like to start a lecture, a study session, or learn an interesting fact about computer science?")
-                .reprompt("Welcome to Ada! Would you like to start a lecture, a study session, or learn an interesting fact about computer science?")
+                .speak(speakerOutput)
+                .reprompt(speakerOutput)
         }
 
         return handlerInput.responseBuilder
@@ -95,31 +107,35 @@ const LaunchRequestHandler = {
     }
 };
 
-const PlayStreamIntentHandler = {
+const LectureTimeHandler = {
     canHandle(handlerInput) {
-        return handlerInput.requestEnvelope.request.type === 'LaunchRequest'
-            || handlerInput.requestEnvelope.request.type === 'IntentRequest'
-            && (
-                handlerInput.requestEnvelope.request.intent.name === 'PlayStreamIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.ResumeIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.LoopOnIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.NextIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.PreviousIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.RepeatIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.ShuffleOnIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.StartOverIntent'
-            );
+        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
+            && Alexa.getIntentName(handlerInput.requestEnvelope) === 'LectureTimeIntent';
     },
     handle(handlerInput) {
+        const time = handlerInput.requestEnvelope.request.intent.slots.lectureTime.value;
+        return TimerHandler.handle(handlerInput, time, LECTURE);
+    }
+};
+
+const StudyTimeHandler = {
+    canHandle(handlerInput) {
+        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
+            && Alexa.getIntentName(handlerInput.requestEnvelope) === 'StudyTimeIntent';
+    },
+    handle(handlerInput) {
+        const time = handlerInput.requestEnvelope.request.intent.slots.studyTime.value;
         const stream = STREAMS[0];
 
         handlerInput.responseBuilder
-            .speak(`starting ${stream.metadata.title}`)
+            .speak(`Setting the mood`)
             .addAudioPlayerPlayDirective('REPLACE_ALL', stream.url, stream.token, 0, null, stream.metadata);
 
-        return handlerInput.responseBuilder
-            .getResponse();
-    },
+        TimerHandler.handle(handlerInput, time, STUDY);
+
+        return handlerInput.responseBuilder.getResponse();
+
+    }
 };
 
 const PlaybackStoppedIntentHandler = {
@@ -137,31 +153,70 @@ const PlaybackStoppedIntentHandler = {
     },
 };
 
-const PlaybackStartedIntentHandler = {
-    canHandle(handlerInput) {
-        return handlerInput.requestEnvelope.request.type === 'AudioPlayer.PlaybackStarted';
-    },
-    handle(handlerInput) {
-        handlerInput.responseBuilder
-            .addAudioPlayerClearQueueDirective('CLEAR_ENQUEUED');
 
+const TimerHandler = {
+    canHandle(handlerInput) {
+        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
+            && Alexa.getIntentName(handlerInput.requestEnvelope) === 'TimerStartIntent';
+    },
+    async handle(handlerInput, time, sessionType) {
+        const readableTime = Util.convertISO8601ToReadableText(time);
+        timerItem.duration = time;
+        timerItem.timerLabel = sessionType;
+        timerItem.triggeringBehavior.operation.textToAnnounce[0].text = `${sessionType} 
+            time is over. Would you like to start a discussion break?`;
+        const speakOutput = `Starting ${sessionType} time for ${readableTime}`;
+        const options = {
+            headers: {
+                "Authorization": `Bearer ${Alexa.getApiAccessToken(handlerInput.requestEnvelope)}`,
+                "Content-Type": "application/json"
+            }
+        };
+        await axios.post('https://api.amazonalexa.com/v1/alerts/timers', timerItem, options)
+            .then(response => {
+                handlerInput.responseBuilder
+                    .speak(speakOutput);
+            })
+            .catch(error => {
+                console.log(error);
+            });
         return handlerInput.responseBuilder
             .getResponse();
-    },
+    }
 };
 
-const ConnectionsResponsetHandler = {
+const StartDiscussionIntentHandler = {
+    canHandle(handlerInput) {
+        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
+            && Alexa.getIntentName(handlerInput.requestEnvelope) === 'StartDiscussionIntent';
+    },
+    async handle(handlerInput) {
+        const question = 'Did you know that?'
+        const snapshot = await DB.collection('diversity').where('test', "==", true).get()
+        console.log(snapshot)
+        //const snapshot =  await DB.collection('diversity').doc(1).get();
+        var speakOutput = '';
+        // if(!snapshot.exists){
+        //      speakOutput = 'Error';
+        // }
+        //else{
+        const data = snapshot.data();
+        console.log(data);
+        speakOutput = data;
+        //}
+        return handlerInput.responseBuilder
+            .speak(speakOutput)
+            .getResponse();
+    }
+};
+const ConnectionsResponseHandler = {
     canHandle(handlerInput) {
         return Alexa.getRequestType(handlerInput.requestEnvelope) === 'Connections.Response';
     },
     handle(handlerInput) {
         const { permissions } = handlerInput.requestEnvelope.context.System.user;
 
-        //console.log(JSON.stringify(handlerInput.requestEnvelope));
-        //console.log(handlerInput.requestEnvelope.request.payload.status);
-
         const status = handlerInput.requestEnvelope.request.payload.status;
-
 
         if (!permissions) {
             return handlerInput.responseBuilder
@@ -178,70 +233,23 @@ const ConnectionsResponsetHandler = {
                 })
                 .getResponse();
         }
-
         switch (status) {
             case "ACCEPTED":
                 handlerInput.responseBuilder
-                    .speak("Welcome to Ada! Would you like to start a lecture, a study session, or learn an interesting fact about computer science?")
-                    .reprompt("Welcome to Ada! Would you like to start a lecture, a study session, or learn an interesting fact about computer science?")
+                    .speak("Welcome to Ada! Would you like to start a lecture, study session, or discussion break?")
+                    .reprompt("Would you like to start a lecture, study session, or discussion break?")
                 break;
             case "DENIED":
                 handlerInput.responseBuilder
                     .speak("Without permissions, I can't set a timer. So I guess that's goodbye.");
                 break;
             case "NOT_ANSWERED":
-
                 break;
             default:
                 handlerInput.responseBuilder
                     .speak("Now that we have permission to set a timer. Would you like to start?")
                     .reprompt('would you like to start?');
         }
-
-        return handlerInput.responseBuilder
-            .getResponse();
-    }
-};
-
-const YesNoIntentHandler = {
-    canHandle(handlerInput) {
-        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
-            && (Alexa.getIntentName(handlerInput.requestEnvelope) === 'AMAZON.YesIntent'
-                || Alexa.getIntentName(handlerInput.requestEnvelope) === 'AMAZON.NoIntent');
-    },
-    async handle(handlerInput) {
-
-        //handle 'yes' utterance
-        if (Alexa.getIntentName(handlerInput.requestEnvelope) === 'AMAZON.YesIntent') {
-
-            const duration = moment.duration(timerItem.duration),
-                hours = (duration.hours() > 0) ? `${duration.hours()} ${(duration.hours() === 1) ? "hour" : "hours"},` : "",
-                minutes = (duration.minutes() > 0) ? `${duration.minutes()} ${(duration.minutes() === 1) ? "minute" : "minutes"} ` : "",
-                seconds = (duration.seconds() > 0) ? `${duration.seconds()} ${(duration.seconds() === 1) ? "second" : "seconds"}` : "";
-
-            const options = {
-                headers: {
-                    "Authorization": `Bearer ${Alexa.getApiAccessToken(handlerInput.requestEnvelope)}`,
-                    "Content-Type": "application/json"
-                }
-            };
-
-            await axios.post('https://api.amazonalexa.com/v1/alerts/timers', timerItem, options)
-                .then(response => {
-                    handlerInput.responseBuilder
-                        .speak(`Your ${timerItem.timerLabel} timer is set for ${hours} ${minutes} ${seconds}.`);
-                })
-                .catch(error => {
-                    console.log(error);
-                });
-        }
-
-        //handle 'no' utterance
-        if (Alexa.getIntentName(handlerInput.requestEnvelope) === 'AMAZON.NoIntent') {
-            handlerInput.responseBuilder
-                .speak('Alright I didn\'t start a timer.');
-        }
-
         return handlerInput.responseBuilder
             .getResponse();
     }
@@ -253,7 +261,7 @@ const HelpIntentHandler = {
             && Alexa.getIntentName(handlerInput.requestEnvelope) === 'AMAZON.HelpIntent';
     },
     handle(handlerInput) {
-        const speakOutput = 'You can say set a timer.';
+        const speakOutput = 'You can say hello to me! How can I help?';
 
         return handlerInput.responseBuilder
             .speak(speakOutput)
@@ -264,20 +272,12 @@ const HelpIntentHandler = {
 
 const CancelAndStopIntentHandler = {
     canHandle(handlerInput) {
-        return handlerInput.requestEnvelope.request.type === 'IntentRequest'
-            && (
-                handlerInput.requestEnvelope.request.intent.name === 'AMAZON.StopIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.PauseIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.CancelIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.LoopOffIntent'
-                || handlerInput.requestEnvelope.request.intent.name === 'AMAZON.ShuffleOffIntent'
-            );
+        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
+            && (Alexa.getIntentName(handlerInput.requestEnvelope) === 'AMAZON.CancelIntent'
+                || Alexa.getIntentName(handlerInput.requestEnvelope) === 'AMAZON.StopIntent');
     },
     handle(handlerInput) {
         const speakOutput = 'Goodbye!';
-        handlerInput.responseBuilder
-            .addAudioPlayerClearQueueDirective('CLEAR_ALL')
-            .addAudioPlayerStopDirective();
         return handlerInput.responseBuilder
             .speak(speakOutput)
             .getResponse();
@@ -294,14 +294,18 @@ const SessionEndedRequestHandler = {
     }
 };
 
+// The intent reflector is used for interaction model testing and debugging.
+// It will simply repeat the intent the user said. You can create custom handlers
+// for your intents by defining them above, then also adding them to the request
+// handler chain below.
 const IntentReflectorHandler = {
     canHandle(handlerInput) {
-        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest';
+        return Alexa.getRequestType(handlerInput.requestEnvelope) === 'IntentRequest'
     },
     handle(handlerInput) {
         const intentName = Alexa.getIntentName(handlerInput.requestEnvelope);
         const speakOutput = `You just triggered ${intentName}`;
-
+        console.log(Alexa.getIntentName(handlerInput.requestEnvelope))
         return handlerInput.responseBuilder
             .speak(speakOutput)
             //.reprompt('add a reprompt if you want to keep the session open for the user to respond')
@@ -309,13 +313,15 @@ const IntentReflectorHandler = {
     }
 };
 
+// Generic error handling to capture any syntax or routing errors. If you receive an error
+// stating the request handler chain is not found, you have not implemented a handler for
+// the intent being invoked or included it in the skill builder below.
 const ErrorHandler = {
     canHandle() {
         return true;
     },
     handle(handlerInput, error) {
         console.log(`~~~~ Error handled: ${error.stack}`);
-        console.log(`handlerInput.requestEnvelope: ${handlerInput.requestEnvelope}`);
         const speakOutput = `Sorry, I had trouble doing what you asked. Please try again.`;
 
         return handlerInput.responseBuilder
@@ -325,24 +331,24 @@ const ErrorHandler = {
     }
 };
 
+// The SkillBuilder acts as the entry point for your skill, routing all request and response
+// payloads to the handlers above. Make sure any new handlers or interceptors you've
+// defined are included below. The order matters - they're processed top to bottom.
 exports.handler = Alexa.SkillBuilders.custom()
-    .withPersistenceAdapter(
-        new persistenceAdapter.S3PersistenceAdapter({bucketName:process.env.S3_PERSISTENCE_BUCKET})
-    )
     .addRequestHandlers(
         LaunchRequestHandler,
-        PlayStreamIntentHandler,
-        PlaybackStartedIntentHandler,
+        LectureTimeHandler,
+        StudyTimeHandler,
         PlaybackStoppedIntentHandler,
-        ConnectionsResponsetHandler,
-        YesNoIntentHandler,
+        TimerHandler,
+        StartDiscussionIntentHandler,
+        ConnectionsResponseHandler,
         HelpIntentHandler,
         CancelAndStopIntentHandler,
         SessionEndedRequestHandler,
-        IntentReflectorHandler,
+        IntentReflectorHandler, // make sure IntentReflectorHandler is last so it doesn't override your custom intent handlers
     )
     .addErrorHandlers(
         ErrorHandler,
     )
-    .withApiClient(new Alexa.DefaultApiClient())
     .lambda();
